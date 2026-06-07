@@ -599,7 +599,7 @@
     }
     
     // Obtener TCO activo para un timestamp y equipo específico (de la orden si existe, sino del config)
-    // Calcula el TCO óptimo como el percentil 10 más bajo de los gaps entre puntos reales.
+    // Calcula el TCO óptimo como el percentil 30 más bajo de los gaps entre puntos reales.
     // Solo considera gaps dentro del límite de ciclo activo (< gapMaximo).
     function calcOptimalTCO(data, fallbackTCO, gapLimitMs) {
       const limit = gapLimitMs ?? CONFIG.gapMaximo;
@@ -612,7 +612,7 @@
       }
       if (gaps.length < 5) return fallbackTCO;
       gaps.sort((a, b) => a - b);
-      const top10pct = Math.max(1, Math.floor(gaps.length * 0.10));
+      const top10pct = Math.max(1, Math.floor(gaps.length * 0.30));
       const best = gaps.slice(0, top10pct);
       const optimal = Math.round(best.reduce((s, v) => s + v, 0) / best.length);
       return optimal > 0 ? optimal : fallbackTCO;
