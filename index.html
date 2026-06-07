@@ -210,16 +210,14 @@
   <div class="container">
     <div class="header">
       <div>
-        <h1>📊 Monitor Multi-Equipo</h1>
-        <div class="subtitle">DataNexo4.0</div>
+        <h1>📊 Monitor Multi-Equipo - TM</h1>
+        <div class="subtitle">Datanexo4.0</div>
       </div>
       <div class="header-controls">
         <button class="theme-toggle" onclick="toggleTheme()" title="Cambiar tema">🌙</button>
         <div class="machine-selector">
           <label>Máquinas:</label>
-          <select id="machineSelector" onchange="changeMachineType()">
-            <option value="inyectoras">Inyectoras</option>
-          </select>
+          <select id="machineSelector" onchange="changeMachineType()"></select>
         </div>
       </div>
     </div>
@@ -232,7 +230,10 @@
         csvUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQ_RedEDVX71AVPKIlhstAEDAn3ibt04ijsUMGB4w3gBauuMbcZ6AncmWB4uU0SvlzdEIZkTY_7HeId/pub?output=csv',
         name: 'Inyectoras',
         tco: 100,
-       // ordersUrl: ''
+        ofMode: 0,
+        simpleGapMin: 40,
+        minPulse: 20,         // Filtro antirebote: ignorar pulsos < X segundos (0 = desactivado)
+        // ordersUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSziuoyPsKM3b1ndIAtcfyCGwy-2pvdOzjt0k0cACsxdhMkEv8pynKY8Ff1ryoBAg/pub?gid=1277864885&single=true&output=csv'
       }
     };
 
@@ -250,10 +251,31 @@
     
     // Mapeo de equipos a nombres reales por tipo de máquina
     const EQUIPMENT_NAMES = {
-      inyectoras: {
+      armadoras: {
         // Dejar vacío para usar índices dinámicos (Armadora 1, 2, 3...)
         // O agregar mapeos personalizados:
         // '221': 'Armadora Custom',
+      },
+      expansoras: {
+        // Agregar mapeo de expansoras si es necesario
+      },
+      boquilladoras: {
+        // Agregar mapeo de boquilladoras si es necesario
+      },
+      engrafadoras: {
+        // Agregar mapeo de engrafadoras si es necesario
+      },
+      tester: {
+        // Agregar mapeo de testers si es necesario
+      },
+      inyectora_km4000: {
+        '92': 'Inyectora KM4000'
+      },
+      inyectora_cosmos: {
+        '91': 'Inyectora Cosmos 1500'
+      },
+      balancines: {
+        // Agregar mapeo de balancines si es necesario
       }
     };
     
@@ -577,6 +599,25 @@
     }
     
     // Obtener TCO activo para un timestamp y equipo específico (de la orden si existe, sino del config)
+    // Calcula el TCO óptimo como el percentil 10 más bajo de los gaps entre puntos reales.
+    // Solo considera gaps dentro del límite de ciclo activo (< gapMaximo).
+    function calcOptimalTCO(data, fallbackTCO, gapLimitMs) {
+      const limit = gapLimitMs ?? CONFIG.gapMaximo;
+      const gaps = [];
+      for (let i = 1; i < data.length; i++) {
+        const gap = (data[i].datetime - data[i-1].datetime) / 1000;
+        if (gap > 0 && gap < limit / 1000) {
+          gaps.push(gap);
+        }
+      }
+      if (gaps.length < 5) return fallbackTCO;
+      gaps.sort((a, b) => a - b);
+      const top10pct = Math.max(1, Math.floor(gaps.length * 0.10));
+      const best = gaps.slice(0, top10pct);
+      const optimal = Math.round(best.reduce((s, v) => s + v, 0) / best.length);
+      return optimal > 0 ? optimal : fallbackTCO;
+    }
+
     function getTCOForTimestamp(timestamp, equipment) {
       const specificOrders = fabricationOrders[equipment] || [];
       const allOrders = fabricationOrders['ALL'] || [];
@@ -776,6 +817,7 @@
               <div class="stat-value" id="stat-avg-${eq}">0</div>
               <div class="stat-label">${label2}</div>
             </div>
+            <div class="stat-item" id="stat-opttco-${eq}" style="display:none; color:#34d399; font-size:0.8em; align-self:center;"></div>
           </div>
         </div>
         
@@ -928,7 +970,23 @@
       
       const config = MACHINE_CONFIGS[currentMachineType];
       const isGolMode = config.isGolMode || false;
+      const isSimpleMode = (config.ofMode === 0) && !isGolMode;
       const tco = config.tco;
+
+      // En modo simple: calcular TCO óptimo del 10% más bajo de gaps
+      // y usarlo como referencia fija en lugar de las órdenes de fabricación
+      let simpleTCO = tco;
+      if (isSimpleMode) {
+        const prodData = data.filter(d => d.code !== 'P');
+        const simpleGapMs = (config.simpleGapMin ?? 3) * tco * 1000;
+        simpleTCO = calcOptimalTCO(prodData, tco, simpleGapMs);
+        equipmentSettings[eq].simpleTCO = simpleTCO;
+      }
+
+      // Multiplicador de gap para decidir si generar amarillos
+      // OF: usa gapTCO * 3 (hardcoded en el loop)
+      // Simple: usa simpleGapMin del config (por defecto 3)
+      const gapMinMult = isSimpleMode ? (config.simpleGapMin ?? 3) : 3;
       
       // MODO ESPECIAL: Balancines (GOL) - Solo mostrar valores reales sin procesamiento
       if (isGolMode) {
@@ -956,9 +1014,13 @@
       const validForAvg = data.filter(d => d.code !== 'P' && d.value <= baseMaxAllowed);
       const avgVal = validForAvg.length > 0 ? Math.round(validForAvg.reduce((s, d) => s + d.value, 0) / validForAvg.length) : tco;
       const complete = [];
-      const verticalLines = []; // Para marcar períodos largos
+      const verticalLines = [];
       let lastRealTime = null;
-      const gapMaximo = CONFIG.gapMaximo; // 7.5 horas
+      // En modo simple: gapMaximo viene de simpleGapMin (horas × ms)
+      // En modo normal: gapMaximo global (7.5h)
+      const gapMaximo = isSimpleMode
+        ? (config.simpleGapMin ?? 7.5) * 60 * 60 * 1000
+        : CONFIG.gapMaximo;
       
       // PROCESAR PARADAS: Detectar rangos P0->P1/P2/P3
       const stopRanges = [];
@@ -1005,21 +1067,80 @@
       // Filtrar códigos P de los datos de producción
       data = data.filter(d => d.code !== 'P');
       
+      // Filtro antirebote: ignorar pulsos menores a minPulse segundos
+      if (config.minPulse > 0) {
+        data = data.filter(d => d.value >= config.minPulse);
+      }
+      
+      // ── PRE-CÁLCULO DE PERÍODOS (modo simple) ──────────────────────────
+      // Identificar períodos de trabajo antes del loop para poder usar
+      // el TCO óptimo por período durante la generación de amarillos
+      let simplePeriods = []; // [{ start, end, optTCO }]
+      
+      if (isSimpleMode && data.length > 0) {
+        // Encontrar cortes de período por gap > gapMaximo
+        const cuts = []; // timestamps de inicio/fin de cada período
+        let pStart = data[0].datetime.getTime();
+        
+        for (let i = 1; i < data.length; i++) {
+          const gap = data[i].datetime - data[i-1].datetime;
+          if (gap > gapMaximo) {
+            cuts.push({ start: pStart, end: data[i-1].datetime.getTime() });
+            pStart = data[i].datetime.getTime();
+          }
+        }
+        cuts.push({ start: pStart, end: data[data.length-1].datetime.getTime() });
+        
+        // Calcular TCO óptimo (10% más bajo) para cada período
+        // Excluir puntos cuyo valor supera 4× el TCO de referencia (lentos)
+        // para que no contaminen el percentil
+        simplePeriods = cuts.map(({ start, end }) => {
+          const pts = data.filter(d => {
+            const t = d.datetime.getTime();
+            return t >= start && t <= end;
+          });
+          if (pts.length < 3) return { start, end, optTCO: simpleTCO };
+          // Primer pasada: calcular mediana para saber qué es "lento"
+          const allVals = pts.map(p => p.value).sort((a,b) => a-b);
+          const median  = allVals[Math.floor(allVals.length / 2)];
+          // Filtrar: solo valores menores a 4× la mediana (elimina outliers lentos)
+          const cleanVals = allVals.filter(v => v <= median * 4);
+          const vals = cleanVals.length >= 3 ? cleanVals : allVals;
+          vals.sort((a,b) => a-b);
+          const n10 = Math.max(1, Math.floor(vals.length * 0.10));
+          const optTCO = Math.round(vals.slice(0, n10).reduce((s,v)=>s+v,0) / n10);
+          return { start, end, optTCO: optTCO > 0 ? optTCO : simpleTCO };
+        });
+      }
+      
+      // Helper: TCO activo en un timestamp para modo simple (por período)
+      function getSimpleTCOAt(ts) {
+        for (const p of simplePeriods) {
+          if (ts >= p.start && ts <= p.end) return p.optTCO;
+        }
+        return simpleTCO; // fallback
+      }
+      
       for (let i = 0; i < data.length; i++) {
         const cur = data[i];
         
-        // TCO DINÁMICO: Obtener TCO de la orden activa en este timestamp
-        const currentTCO = getTCOForTimestamp(cur.datetime.getTime(), eq);
+        // TCO activo: modo simple usa TCO óptimo del período; OF usa orden activa
+        const currentTCO = isSimpleMode
+          ? getSimpleTCOAt(cur.datetime.getTime())
+          : getTCOForTimestamp(cur.datetime.getTime(), eq);
         const maxAllowed = currentTCO * 4;
         const avgInt = currentTCO * 1000;
         
+        // Comparar siempre contra cur.value (dato crudo), nunca contra p.y
         const isOverLimit = cur.value > maxAllowed;
         
         if (lastRealTime) {
           const gap = cur.datetime - lastRealTime;
           
-          // TCO para el gap (usar TCO del último punto)
-          const gapTCO = getTCOForTimestamp(lastRealTime.getTime());
+          // TCO para el gap
+          const gapTCO = isSimpleMode
+            ? simpleTCO
+            : getTCOForTimestamp(lastRealTime.getTime());
           const gapAvgInt = gapTCO * 1000;
           
           // Detectar período largo (>7.5 horas)
@@ -1061,7 +1182,7 @@
               const adjustedTime = new Date(cur.datetime.getTime() - avgInt);
               complete.push({ x: adjustedTime.getTime(), y: cur.value, isProjected: false, isHollow: false });
             }
-          } else if (gap > gapAvgInt * 3) {
+          } else if (gap > gapAvgInt * gapMinMult) {
             // Gap normal (>3×TCO pero <gapMaximo)
             let pt = new Date(lastRealTime.getTime() + gapAvgInt);
             const targetTime = cur.datetime;
@@ -1071,19 +1192,20 @@
             const MAX_YELLOW_POINTS = 10000;
             
             while (pt < targetTime && safetyCounter < MAX_YELLOW_POINTS) {
-              // Usar TCO de la orden activa en cada punto amarillo
-              const yellowTCO = getTCOForTimestamp(pt.getTime(), eq);
+              const yellowTCO = isSimpleMode
+                ? getSimpleTCOAt(pt.getTime())
+                : getTCOForTimestamp(pt.getTime(), eq);
               const stopType = getStopType(pt.getTime());
               complete.push({ 
                 x: pt.getTime(), 
                 y: yellowTCO, 
                 isProjected: true, 
                 isHollow: false,
-                stopType: stopType // 'red', 'green', 'gray', o null
+                stopType: stopType
               });
-              
-              // Incrementar usando el TCO del siguiente punto
-              const nextYellowTCO = getTCOForTimestamp(pt.getTime() + 1000, eq); // +1 segundo
+              const nextYellowTCO = isSimpleMode
+                ? getSimpleTCOAt(pt.getTime() + 1000)
+                : getTCOForTimestamp(pt.getTime() + 1000, eq);
               pt = new Date(pt.getTime() + (nextYellowTCO * 1000));
               safetyCounter++;
             }
@@ -1168,20 +1290,21 @@
       
       // Proyecciones hasta ahora
       const now = new Date(), since = now - lastRealTime;
-      // TCO del último punto para calcular si hay gap
-      const lastTCO = getTCOForTimestamp(lastRealTime ? lastRealTime.getTime() : now.getTime(), eq);
+      const lastTCO = isSimpleMode
+        ? getSimpleTCOAt(lastRealTime ? lastRealTime.getTime() : now.getTime())
+        : getTCOForTimestamp(lastRealTime ? lastRealTime.getTime() : now.getTime(), eq);
       const lastAvgInt = lastTCO * 1000;
       
-      if (since > lastAvgInt * 3) {
+      if (since > lastAvgInt * gapMinMult) {
         let pt = new Date(lastRealTime.getTime() + lastAvgInt);
         
-        // SEGURIDAD: Limitar proyecciones
         let safetyCounter = 0;
         const MAX_PROJECTIONS = 5000;
         
         while (pt <= now && safetyCounter < MAX_PROJECTIONS) {
-          // Usar TCO de la orden activa en cada proyección
-          const projTCO = getTCOForTimestamp(pt.getTime(), eq);
+          const projTCO = isSimpleMode
+            ? simpleTCO
+            : getTCOForTimestamp(pt.getTime(), eq);
           const stopType = getStopType(pt.getTime());
           complete.push({ 
             x: pt.getTime(), 
@@ -1417,49 +1540,150 @@
           };
         });
       } else {
-        // Si no hay órdenes, usar TCO estático del config
-        annotations.tcoLine = {
-          type: 'line',
-          yMin: tco,
-          yMax: tco,
-          borderColor: '#fbbf24',
-          borderWidth: 1,
-          borderDash: [5, 5],
-          label: {
-            content: `TCO: ${tco}s`,
-            enabled: true,
-            position: 'end',
-            backgroundColor: 'rgba(251, 191, 36, 0.8)',
-            color: '#000',
-            font: { size: 10 }
-          }
-        };
+        // Sin órdenes: línea TCO estática del config (solo en modo OF)
+        if (!isSimpleMode) {
+          annotations.tcoLine = {
+            type: 'line',
+            yMin: tco,
+            yMax: tco,
+            borderColor: '#fbbf24',
+            borderWidth: 1,
+            borderDash: [5, 5],
+            label: {
+              content: `TCO: ${tco}s`,
+              enabled: true,
+              position: 'end',
+              backgroundColor: 'rgba(251, 191, 36, 0.8)',
+              color: '#000',
+              font: { size: 10 }
+            }
+          };
+        }
+        // En modo simple: la línea TCO la genera periodTCO${pi} por período
       }
       
-      verticalLines.forEach((line, idx) => {
-        annotations[`vline${idx}`] = {
-          type: 'line',
-          xMin: line.x,
-          xMax: line.x,
-          yMin: (value) => value.chart.scales.y.min,
-          yMax: (value) => {
-            const yScale = value.chart.scales.y;
-            const range = yScale.max - yScale.min;
-            return yScale.min + (range * 0.2); // 20% de altura
-          },
-          borderColor: '#ff6b6b',
-          borderWidth: 3,
-          borderDash: [5, 5],
-          label: {
-            content: line.label,
-            enabled: true,
-            position: 'start',
-            backgroundColor: 'rgba(255, 107, 107, 0.8)',
-            color: 'white',
-            font: { size: 10 }
-          }
-        };
-      });
+      // ── Anotaciones de líneas verticales de período ──────────────────
+      // En modo simple: líneas completas rojas punteadas + tooltip de eficiencia
+      // En modo normal: líneas cortas (20%) azules
+
+      if (isSimpleMode) {
+        // Líneas verticales rojas punteadas completas en cada corte de período
+        verticalLines.forEach((line, idx) => {
+          annotations[`vline${idx}`] = {
+            type: 'line',
+            xMin: line.x,
+            xMax: line.x,
+            borderColor: 'rgba(239, 68, 68, 0.6)',
+            borderWidth: 2,
+            borderDash: [6, 4]
+          };
+        });
+
+        // Tooltip de eficiencia y línea TCO por período (usa simplePeriods pre-calculados)
+        simplePeriods.forEach((sp, pi) => {
+          // Puntos azules reales (no proyectados, no huecos)
+          const bluePoints   = complete.filter(p =>
+            !p.isProjected && !p.isHollow && p.x >= sp.start && p.x <= sp.end
+          );
+          // Puntos amarillos (piezas perdidas dentro del período)
+          const yellowPoints = complete.filter(p =>
+            p.isProjected && !p.isHollow && p.x >= sp.start && p.x <= sp.end
+          );
+
+          const totalPosible = bluePoints.length + yellowPoints.length;
+          if (totalPosible < 3) return;
+
+          const optTCO = sp.optTCO;
+          const midX   = (sp.start + sp.end) / 2;
+
+          // Factor 1: ocupación — qué fracción del tiempo se produjo realmente
+          const ocupacion = bluePoints.length / totalPosible;
+
+          // Factor 2: velocidad — qué tan cerca están los azules del TCO óptimo
+          // Para puntos huecos (lentos), usar realValue que es el tiempo real
+          // p.y está seteado al TCO (posición visual), no al valor real
+          const velSum = bluePoints.reduce((s, p) => {
+            const actualValue = p.realValue ?? p.y; // usar valor real siempre
+            return s + Math.min(1, optTCO / Math.max(actualValue, 1));
+          }, 0);
+          const velocidad = bluePoints.length > 0 ? velSum / bluePoints.length : 0;
+
+          // Eficiencia = ocupación × velocidad × 100
+          const efficiency = Math.round(ocupacion * velocidad * 100);
+
+          const color = efficiency >= 85 ? '#16a34a'
+                      : efficiency >= 65 ? '#f59e0b'
+                      : '#dc2626';
+
+          annotations[`periodLabel${pi}`] = {
+            type: 'label',
+            xValue: midX,
+            yValue: ctx => {
+              const ys = ctx.chart.scales.y;
+              return ys.max - (ys.max - ys.min) * 0.08;
+            },
+            content: [
+              `Ef: ${efficiency}%`,
+              `${bluePoints.length} / ${totalPosible} piezas`,
+              `TCO: ${optTCO}s`
+            ],
+            backgroundColor: 'rgba(0,0,0,0.75)',
+            color: color,
+            font: { size: 10, weight: 'bold', family: 'monospace' },
+            padding: { x: 8, y: 4 },
+            borderRadius: 5,
+            textAlign: 'center',
+            borderColor: color,
+            borderWidth: 1
+          };
+
+          annotations[`periodTCO${pi}`] = {
+            type: 'line',
+            xMin: sp.start,
+            xMax: sp.end,
+            yMin: optTCO,
+            yMax: optTCO,
+            borderColor: '#fbbf24',
+            borderWidth: 1,
+            borderDash: [5, 5],
+            label: {
+              content: `TCO ópt: ${optTCO}s`,
+              enabled: true,
+              position: 'end',
+              backgroundColor: 'rgba(251, 191, 36, 0.8)',
+              color: '#000',
+              font: { size: 10 }
+            }
+          };
+        });
+
+      } else {
+        // Modo normal: líneas cortas azules (comportamiento original)
+        verticalLines.forEach((line, idx) => {
+          annotations[`vline${idx}`] = {
+            type: 'line',
+            xMin: line.x,
+            xMax: line.x,
+            yMin: (value) => value.chart.scales.y.min,
+            yMax: (value) => {
+              const yScale = value.chart.scales.y;
+              const range = yScale.max - yScale.min;
+              return yScale.min + (range * 0.2);
+            },
+            borderColor: '#ff6b6b',
+            borderWidth: 3,
+            borderDash: [5, 5],
+            label: {
+              content: line.label,
+              enabled: true,
+              position: 'start',
+              backgroundColor: 'rgba(255, 107, 107, 0.8)',
+              color: 'white',
+              font: { size: 10 }
+            }
+          };
+        });
+      }
       
       if (charts[eq]) {
         charts[eq].data.datasets[0].data = complete;
@@ -1541,20 +1765,14 @@
                   label: c => {
                     const config = MACHINE_CONFIGS[currentMachineType];
                     const unit = config.useGolCode ? ' piezas' : ' seg';
-                    const point = complete[c.dataIndex];
+                    // Leer siempre desde el dataset actual, no del closure
+                    const liveData = c.chart.data.datasets[0].data;
+                    const point = liveData[c.dataIndex];
                     
-                    // Validar que point existe
-                    if (!point) {
-                      return `Valor: ${c.parsed.y}${unit}`;
-                    }
+                    if (!point) return `Valor: ${c.parsed.y}${unit}`;
                     
-                    // Mostrar código si es TOK o TNG
-                    if (point.code === 'TOK') {
-                      return `✅ Aprobado: ${c.parsed.y}${unit}`;
-                    }
-                    if (point.code === 'TNG') {
-                      return `❌ Rechazado: ${c.parsed.y}${unit}`;
-                    }
+                    if (point.code === 'TOK') return `✅ Aprobado: ${c.parsed.y}${unit}`;
+                    if (point.code === 'TNG') return `❌ Rechazado: ${c.parsed.y}${unit}`;
                     
                     if (point.isHollow) {
                       return `🔵 Proceso lento: ${point.realValue}${unit} (excede TCO)`;
@@ -1600,15 +1818,7 @@
                 }
               },
               y: {
-                beginAtZero: true,
-                suggestedMax: function(context) {
-                  const data = context.chart.data.datasets[0].data;
-                  if (data && data.length > 0) {
-                    const maxY = Math.max(...data.map(d => d.y || 0));
-                    return maxY * 1.1; // 10% más
-                  }
-                  return undefined;
-                },
+                beginAtZero: false,
                 grid: { color: 'rgba(0,0,0,0.05)' },
                 ticks: { 
                   color: '#666',
@@ -1762,15 +1972,7 @@
                 title: { display: true, text: 'Hora', color: '#666', font: { weight: 'bold', size: 14 } }
               },
               y: {
-                beginAtZero: true,
-                suggestedMax: function(context) {
-                  const data = context.chart.data.datasets[0].data;
-                  if (data && data.length > 0) {
-                    const maxY = Math.max(...data.map(d => d.y || 0));
-                    return maxY * 1.05;
-                  }
-                  return undefined;
-                },
+                beginAtZero: false,
                 grid: { color: 'rgba(0,0,0,0.05)' },
                 ticks: { color: '#666', font: { weight: 'bold' } },
                 title: { display: true, text: 'Golpes (cada 5 min)', color: '#666', font: { weight: 'bold', size: 14 } }
@@ -1826,38 +2028,60 @@
       if (!chart) return;
       
       const xScale = chart.scales.x;
-      const yScale = chart.scales.y;
-      const data = chart.data.datasets[0].data;
+      const data   = chart.data.datasets[0].data;
       
-      // Filtrar puntos visibles en el viewport actual
-      const visibleData = data.filter(d => {
-        return d.x >= xScale.min && d.x <= xScale.max && 
-               d.y >= yScale.min && d.y <= yScale.max;
-      });
+      // Puntos dentro de la ventana X visible (misma lógica que las stats)
+      const visibleData = data.filter(d => d.x >= xScale.min && d.x <= xScale.max);
       
-      // Verificar si es modo GOL (Balancines)
-      const config = MACHINE_CONFIGS[currentMachineType];
+      // ── Ajustar escala Y a lo visible ────────────────────────────────
+      if (visibleData.length > 0) {
+        const ys   = visibleData.map(d => d.y);
+        const yMin = Math.min(...ys);
+        const yMax = Math.max(...ys);
+        const pad  = Math.max((yMax - yMin) * 0.1, yMax * 0.05, 1);
+        
+        chart.options.scales.y.min = Math.max(0, Math.floor(yMin - pad));
+        chart.options.scales.y.max = Math.ceil(yMax + pad);
+        chart.options.scales.y.suggestedMax = undefined;
+        chart.options.scales.y.beginAtZero  = false;
+        chart.update('none');
+      }
+
+      // ── Stats en el card ─────────────────────────────────────────────
+      const config    = MACHINE_CONFIGS[currentMachineType];
       const isGolMode = config.isGolMode || false;
       
+      // Re-filtrar con el Y actualizado
+      const yScale     = chart.scales.y;
+      const visibleAll = visibleData.filter(d => d.y >= yScale.min && d.y <= yScale.max);
+      
       if (isGolMode) {
-        // MODO GOL: Mostrar suma total de golpes y cantidad de registros
-        const totalGolpes = visibleData.reduce((sum, d) => sum + d.y, 0);
-        const cantidadRegistros = visibleData.length;
-        
+        const totalGolpes       = visibleAll.reduce((sum, d) => sum + d.y, 0);
+        const cantidadRegistros = visibleAll.length;
         document.getElementById(`stat-total-${eq}`).textContent = totalGolpes.toLocaleString('es-AR');
-        document.getElementById(`stat-avg-${eq}`).textContent = cantidadRegistros;
+        document.getElementById(`stat-avg-${eq}`).textContent   = cantidadRegistros;
       } else {
-        // MODO NORMAL: Procesos y promedio
-        const processes = visibleData.filter(d => !d.isProjected);
+        const processes    = visibleAll.filter(d => !d.isProjected);
+        const isSimpleMode = (config.ofMode === 0) && !isGolMode;
         
         if (processes.length > 0) {
           const values = processes.map(d => d.realValue || d.y);
-          const avg = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+          const avg    = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
           document.getElementById(`stat-total-${eq}`).textContent = processes.length;
-          document.getElementById(`stat-avg-${eq}`).textContent = avg;
+          document.getElementById(`stat-avg-${eq}`).textContent   = avg;
         } else {
           document.getElementById(`stat-total-${eq}`).textContent = 0;
-          document.getElementById(`stat-avg-${eq}`).textContent = '-';
+          document.getElementById(`stat-avg-${eq}`).textContent   = '-';
+        }
+        
+        const optTCOEl = document.getElementById(`stat-opttco-${eq}`);
+        if (optTCOEl) {
+          if (isSimpleMode && equipmentSettings[eq]?.simpleTCO) {
+            optTCOEl.textContent = `TCO óptimo: ${equipmentSettings[eq].simpleTCO}s`;
+            optTCOEl.style.display = '';
+          } else {
+            optTCOEl.style.display = 'none';
+          }
         }
       }
     }
@@ -2399,6 +2623,18 @@ Generado: ${new Date().toLocaleString('es-AR')}`;
         alert('No se pudo copiar al portapapeles');
       });
     }
+
+    // Generar opciones del selector desde MACHINE_CONFIGS
+    (function buildSelector() {
+      const sel = document.getElementById('machineSelector');
+      Object.entries(MACHINE_CONFIGS).forEach(([key, cfg]) => {
+        if (!cfg || !cfg.csvUrl || !cfg.name) return; // ignorar inválidas
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = cfg.name;
+        sel.appendChild(opt);
+      });
+    })();
 
     setInterval(() => loadData(), CONFIG.updateInterval);
     loadData();
