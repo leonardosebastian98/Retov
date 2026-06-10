@@ -232,8 +232,8 @@
         tco: null,
         ofMode: 0,
         simpleGapMin: 0.5,
-        minPulse: 40,         // Filtro antirebote: ignorar pulsos < X segundos (0 = desactivado)
-        // ordersUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSziuoyPsKM3b1ndIAtcfyCGwy-2pvdOzjt0k0cACsxdhMkEv8pynKY8Ff1ryoBAg/pub?gid=1277864885&single=true&output=csv'
+        minPulse: 20,         // Filtro antirebote: ignorar pulsos < X segundos (0 = desactivado)
+        // ordersUrl: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQ_RedEDVX71AVPKIlhstAEDAn3ibt04ijsUMGB4w3gBauuMbcZ6AncmWB4uU0SvlzdEIZkTY_7HeId/pub?output=csv'
       }
     };
 
@@ -241,7 +241,7 @@
     const CONFIG = { 
       filterCode: 'TM', 
       updateInterval: 10000,
-      gapMaximo: 40 * 60 * 60 * 1000 // 40 horas en milisegundos
+      gapMaximo: 7.5 * 60 * 60 * 1000 // 7.5 horas en milisegundos
     };
     let equipmentData = {}, charts = {}, lastDataHash = '';
     let equipmentSettings = {}; // Configuración individual por equipo
@@ -251,31 +251,10 @@
     
     // Mapeo de equipos a nombres reales por tipo de máquina
     const EQUIPMENT_NAMES = {
-      armadoras: {
+      inyectoras: {
         // Dejar vacío para usar índices dinámicos (Armadora 1, 2, 3...)
         // O agregar mapeos personalizados:
         // '221': 'Armadora Custom',
-      },
-      expansoras: {
-        // Agregar mapeo de expansoras si es necesario
-      },
-      boquilladoras: {
-        // Agregar mapeo de boquilladoras si es necesario
-      },
-      engrafadoras: {
-        // Agregar mapeo de engrafadoras si es necesario
-      },
-      tester: {
-        // Agregar mapeo de testers si es necesario
-      },
-      inyectora_km4000: {
-        '92': 'Inyectora KM4000'
-      },
-      inyectora_cosmos: {
-        '91': 'Inyectora Cosmos 1500'
-      },
-      balancines: {
-        // Agregar mapeo de balancines si es necesario
       }
     };
     
@@ -447,7 +426,7 @@
         if (!line) continue;
         
         // Parsear CSV respetando campos entre comillas
-        // Ej: 00003118,CVB395/S,850,240,SEMI,14/3/26,12:00 p.m.,"221, 222",14/3/2026,00:15
+        // Ej: 3000003118,CVB395/S,850,240,SEMI,14/3/26,12:00 p.m.,"221, 222",14/3/2026,00:15
         const parts = [];
         let current = '';
         let inQuotes = false;
@@ -507,7 +486,7 @@
         // Parsear fecha/hora de fin (formato 24h simple: "00:15")
         let endDatetime = null;
         if (endDateStr && endTimeStr) {
-          // Hora fin ya está en 24h: "00:15", "01:"
+          // Hora fin ya está en 24h: "00:15", "01:30"
           const endTime24 = endTimeStr.includes(':') ? endTimeStr + (endTimeStr.split(':').length < 3 ? ':00' : '') : null;
           if (endTime24) endDatetime = parseDateTime(endDateStr, endTime24);
         }
@@ -599,7 +578,7 @@
     }
     
     // Obtener TCO activo para un timestamp y equipo específico (de la orden si existe, sino del config)
-    // Calcula el TCO óptimo como el percentil  más bajo de los gaps entre puntos reales.
+    // Calcula el TCO óptimo como el percentil 10 más bajo de los gaps entre puntos reales.
     // Solo considera gaps dentro del límite de ciclo activo (< gapMaximo).
     function calcOptimalTCO(data, fallbackTCO, gapLimitMs) {
       const limit = gapLimitMs ?? CONFIG.gapMaximo;
@@ -612,7 +591,7 @@
       }
       if (gaps.length < 5) return fallbackTCO;
       gaps.sort((a, b) => a - b);
-      const top10pct = Math.max(1, Math.floor(gaps.length * 0.1));
+      const top10pct = Math.max(1, Math.floor(gaps.length * 0.10));
       const best = gaps.slice(0, top10pct);
       const optimal = Math.round(best.reduce((s, v) => s + v, 0) / best.length);
       return optimal > 0 ? optimal : fallbackTCO;
@@ -778,7 +757,7 @@
           // Inicializar configuración del equipo
           equipmentSettings[eq] = {
             filter: 1440,
-            pointSize: 4,
+            pointSize: 2,
             dateFrom: null,
             dateTo: null,
             selection: null,
@@ -825,7 +804,7 @@
           <div class="control-group">
             <label>Tamaño:</label>
             <input type="range" min="1" max="5" value="2" style="width:80px" oninput="updatePointSize('${eq}', this.value)">
-            <span id="size-${eq}">4px</span>
+            <span id="size-${eq}">2px</span>
           </div>
           
           <div class="time-filters">
@@ -1078,8 +1057,8 @@
       let simplePeriods = []; // [{ start, end, optTCO }]
       
       if (isSimpleMode && data.length > 0) {
-        // Encontrar cortes de período por gap > gapMaximo
-        const cuts = []; // timestamps de inicio/fin de cada período
+        const topPercent = config.topPercent ?? 0.30; // fracción configurable, default 10%
+        const cuts = [];
         let pStart = data[0].datetime.getTime();
         
         for (let i = 1; i < data.length; i++) {
@@ -1091,24 +1070,18 @@
         }
         cuts.push({ start: pStart, end: data[data.length-1].datetime.getTime() });
         
-        // Calcular TCO óptimo (10% más bajo) para cada período
-        // Excluir puntos cuyo valor supera 4× el TCO de referencia (lentos)
-        // para que no contaminen el percentil
         simplePeriods = cuts.map(({ start, end }) => {
           const pts = data.filter(d => {
             const t = d.datetime.getTime();
             return t >= start && t <= end;
           });
           if (pts.length < 3) return { start, end, optTCO: simpleTCO };
-          // Primer pasada: calcular mediana para saber qué es "lento"
           const allVals = pts.map(p => p.value).sort((a,b) => a-b);
           const median  = allVals[Math.floor(allVals.length / 2)];
-          // Filtrar: solo valores menores a 4× la mediana (elimina outliers lentos)
           const cleanVals = allVals.filter(v => v <= median * 4);
           const vals = cleanVals.length >= 3 ? cleanVals : allVals;
-          vals.sort((a,b) => a-b);
-          const n10 = Math.max(1, Math.floor(vals.length * 0.10));
-          const optTCO = Math.round(vals.slice(0, n10).reduce((s,v)=>s+v,0) / n10);
+          const n = Math.max(1, Math.floor(vals.length * topPercent));
+          const optTCO = Math.round(vals.slice(0, n).reduce((s,v)=>s+v,0) / n);
           return { start, end, optTCO: optTCO > 0 ? optTCO : simpleTCO };
         });
       }
@@ -1137,50 +1110,21 @@
         if (lastRealTime) {
           const gap = cur.datetime - lastRealTime;
           
-          // TCO para el gap
+          // TCO para evaluar el gap
           const gapTCO = isSimpleMode
-            ? simpleTCO
-            : getTCOForTimestamp(lastRealTime.getTime());
+            ? getSimpleTCOAt(lastRealTime.getTime())
+            : getTCOForTimestamp(lastRealTime.getTime(), eq);
           const gapAvgInt = gapTCO * 1000;
           
-          // Detectar período largo (>7.5 horas)
           if (gap > gapMaximo) {
-            // Marcar el último punto antes del período largo
-            verticalLines.push({
-              x: lastRealTime.getTime(),
-              label: 'Fin período'
-            });
+            // Gap largo: marcar líneas de período y pushear el punto en su posición real
+            verticalLines.push({ x: lastRealTime.getTime(), label: 'Fin período' });
+            verticalLines.push({ x: cur.datetime.getTime(), label: 'Inicio período' });
             
-            // Marcar el primer punto después del período largo
-            verticalLines.push({
-              x: cur.datetime.getTime(),
-              label: 'Inicio período'
-            });
-            
-            // El primer punto después de gap largo debe estar en tiempo estándar
             if (isOverLimit) {
-              // Remover amarillos anteriores coincidentes
-              const tolerance = (currentTCO / 2) * 1000;
-              const coincidentIndices = [];
-              
-              for (let idx = complete.length - 1; idx >= 0; idx--) {
-                const p = complete[idx];
-                if (p.isProjected && !p.isHollow && 
-                    p.x < cur.datetime.getTime() && 
-                    Math.abs(p.x - cur.datetime.getTime()) <= tolerance) {
-                  coincidentIndices.push(idx);
-                }
-              }
-              
-              for (const idx of coincidentIndices) {
-                complete.splice(idx, 1);
-              }
-              
               complete.push({ x: cur.datetime.getTime(), y: currentTCO, isProjected: false, isHollow: true, realValue: cur.value });
             } else {
-              // Punto normal, ajustar a tiempo estándar (TCO antes del punto real)
-              const adjustedTime = new Date(cur.datetime.getTime() - avgInt);
-              complete.push({ x: adjustedTime.getTime(), y: cur.value, isProjected: false, isHollow: false });
+              complete.push({ x: cur.datetime.getTime(), y: cur.value, isProjected: false, isHollow: false });
             }
           } else if (gap > gapAvgInt * gapMinMult) {
             // Gap normal (>3×TCO pero <gapMaximo)
@@ -1581,34 +1525,34 @@
 
         // Tooltip de eficiencia y línea TCO por período (usa simplePeriods pre-calculados)
         simplePeriods.forEach((sp, pi) => {
-          // Puntos azules reales (no proyectados, no huecos)
-          const bluePoints   = complete.filter(p =>
-            !p.isProjected && !p.isHollow && p.x >= sp.start && p.x <= sp.end
+          // Todos los puntos reales del período (azules + lentos/huecos)
+          const realPoints   = complete.filter(p =>
+            !p.isProjected && p.x >= sp.start && p.x <= sp.end
           );
-          // Puntos amarillos (piezas perdidas dentro del período)
           const yellowPoints = complete.filter(p =>
             p.isProjected && !p.isHollow && p.x >= sp.start && p.x <= sp.end
           );
 
-          const totalPosible = bluePoints.length + yellowPoints.length;
-          if (totalPosible < 3) return;
+          if (realPoints.length + yellowPoints.length < 3) return;
 
           const optTCO = sp.optTCO;
           const midX   = (sp.start + sp.end) / 2;
 
-          // Factor 1: ocupación — qué fracción del tiempo se produjo realmente
-          const ocupacion = bluePoints.length / totalPosible;
+          // Izquierda: piezas hechas = todos los puntos reales (incluyendo lentos)
+          const hechas = realPoints.length;
 
-          // Factor 2: velocidad — qué tan cerca están los azules del TCO óptimo
-          // Para puntos huecos (lentos), usar realValue que es el tiempo real
-          // p.y está seteado al TCO (posición visual), no al valor real
-          const velSum = bluePoints.reduce((s, p) => {
-            const actualValue = p.realValue ?? p.y; // usar valor real siempre
-            return s + Math.min(1, optTCO / Math.max(actualValue, 1));
+          // Derecha: piezas posibles = duración del período / TCO óptimo
+          const duracionMs = sp.end - sp.start;
+          const posibles   = Math.round(duracionMs / 1000 / optTCO);
+
+          const ocupacion = Math.min(1, hechas / Math.max(posibles, 1));
+
+          const velSum  = realPoints.reduce((s, p) => {
+            const v = p.realValue ?? p.y;
+            return s + Math.min(1, optTCO / Math.max(v, 1));
           }, 0);
-          const velocidad = bluePoints.length > 0 ? velSum / bluePoints.length : 0;
+          const velocidad = realPoints.length > 0 ? velSum / realPoints.length : 0;
 
-          // Eficiencia = ocupación × velocidad × 100
           const efficiency = Math.round(ocupacion * velocidad * 100);
 
           const color = efficiency >= 85 ? '#16a34a'
@@ -1620,21 +1564,22 @@
             xValue: midX,
             yValue: ctx => {
               const ys = ctx.chart.scales.y;
-              return ys.max - (ys.max - ys.min) * 0.08;
+              return ys.max - (ys.max - ys.min) * 0.22;
             },
             content: [
               `Ef: ${efficiency}%`,
-              `${bluePoints.length} / ${totalPosible} piezas`,
-              `TCO: ${optTCO}s`
+              `${hechas} / ${posibles} piezas`,
+              `TCO ópt: ${optTCO}s`
             ],
-            backgroundColor: 'rgba(0,0,0,0.75)',
+            backgroundColor: 'rgba(0,0,0,0.65)',
             color: color,
-            font: { size: 10, weight: 'bold', family: 'monospace' },
-            padding: { x: 8, y: 4 },
-            borderRadius: 5,
+            font: { size: 20, weight: 'bold', family: 'monospace' },
+            padding: { x: 10, y: 7 },
+            borderRadius: 10,
             textAlign: 'center',
             borderColor: color,
-            borderWidth: 1
+            borderWidth: 2,
+            periodData: { eq, startTime: sp.start, endTime: sp.end }
           };
 
           annotations[`periodTCO${pi}`] = {
@@ -2162,7 +2107,6 @@
             const annotation = annotations[key];
             const order = annotation.orderData;
             
-            // Calcular posición del tooltip
             const xScale = chart.scales.x;
             const yScale = chart.scales.y;
             
@@ -2170,14 +2114,29 @@
             const tooltipY = yScale.max * 0.85;
             const tooltipYPixel = yScale.getPixelForValue(tooltipY);
             
-            // Dimensiones aproximadas del tooltip (140px ancho, ~100px alto)
             const tooltipWidth = 140;
             const tooltipHeight = 100;
             
             if (x >= tooltipX && x <= tooltipX + tooltipWidth &&
                 y >= tooltipYPixel - tooltipHeight && y <= tooltipYPixel) {
-              // Click en el tooltip - hacer zoom a la orden
               zoomToOrder(eq, order);
+              e.stopPropagation();
+              return;
+            }
+          }
+          
+          // Click en tooltip de período (modo simple)
+          if (key.startsWith('periodLabel') && annotations[key].periodData) {
+            const pd = annotations[key].periodData;
+            const xScale = chart.scales.x;
+            const yScale = chart.scales.y;
+            
+            const centerPixelX = xScale.getPixelForValue((pd.startTime + pd.endTime) / 2);
+            const centerPixelY = yScale.getPixelForValue(yScale.max - (yScale.max - yScale.min) * 0.08);
+            
+            // Área de click aproximada al tamaño del label
+            if (Math.abs(x - centerPixelX) < 120 && Math.abs(y - centerPixelY) < 50) {
+              zoomToOrder(eq, { startTime: pd.startTime, endTime: pd.endTime });
               e.stopPropagation();
               return;
             }
