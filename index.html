@@ -241,7 +241,7 @@
     const CONFIG = { 
       filterCode: 'TM', 
       updateInterval: 10000,
-      gapMaximo: 7.5 * 60 * 60 * 1000 // 7.5 horas en milisegundos
+      gapMaximo: 0.5 * 60 * 60 * 1000 // 0.5 horas en milisegundos
     };
     let equipmentData = {}, charts = {}, lastDataHash = '';
     let equipmentSettings = {}; // Configuración individual por equipo
@@ -950,10 +950,28 @@
       const config = MACHINE_CONFIGS[currentMachineType];
       const isGolMode = config.isGolMode || false;
       const isSimpleMode = (config.ofMode === 0) && !isGolMode;
-      const tco = config.tco;
+      // Filtrar códigos P de los datos de producción
+      data = data.filter(d => d.code !== 'P');
+      
+      // Filtro antirebote: ignorar pulsos menores a minPulse segundos
+      if (config.minPulse > 0) {
+        data = data.filter(d => d.value >= config.minPulse);
+      }
+
+      // Si tco es null, estimarlo DESPUÉS del filtro minPulse para no contaminar con rebotes
+      let tco = config.tco;
+      if (!tco) {
+        const prodVals = data.filter(d => d.value > 0).map(d => d.value).sort((a,b) => a-b);
+        if (prodVals.length > 0) {
+          const n = Math.max(1, Math.floor(prodVals.length * 0.1));
+          tco = Math.round(prodVals.slice(0, n).reduce((s,v)=>s+v,0) / n);
+        } else {
+          tco = 60;
+        }
+        tco = Math.max(tco, 1); // nunca 0
+      }
 
       // En modo simple: calcular TCO óptimo del 10% más bajo de gaps
-      // y usarlo como referencia fija en lugar de las órdenes de fabricación
       let simpleTCO = tco;
       if (isSimpleMode) {
         const prodData = data.filter(d => d.code !== 'P');
@@ -962,10 +980,8 @@
         equipmentSettings[eq].simpleTCO = simpleTCO;
       }
 
-      // Multiplicador de gap para decidir si generar amarillos
-      // OF: usa gapTCO * 3 (hardcoded en el loop)
-      // Simple: usa simpleGapMin del config (por defecto 3)
-      const gapMinMult = isSimpleMode ? (config.simpleGapMin ?? 3) : 3;
+      // Multiplicador de gap para decidir si generar amarillos — siempre 3× el TCO
+      const gapMinMult = 3;
       
       // MODO ESPECIAL: Balancines (GOL) - Solo mostrar valores reales sin procesamiento
       if (isGolMode) {
@@ -995,6 +1011,7 @@
       const complete = [];
       const verticalLines = [];
       let lastRealTime = null;
+      let lastRealValue = 0;
       // En modo simple: gapMaximo viene de simpleGapMin (horas × ms)
       // En modo normal: gapMaximo global (7.5h)
       const gapMaximo = isSimpleMode
@@ -1081,7 +1098,7 @@
           const cleanVals = allVals.filter(v => v <= median * 4);
           const vals = cleanVals.length >= 3 ? cleanVals : allVals;
           const n = Math.max(1, Math.floor(vals.length * topPercent));
-          const optTCO = Math.round(vals.slice(0, n).reduce((s,v)=>s+v,0) / n);
+          const optTCO = Math.max(1, Math.round(vals.slice(0, n).reduce((s,v)=>s+v,0) / n));
           return { start, end, optTCO: optTCO > 0 ? optTCO : simpleTCO };
         });
       }
@@ -1110,23 +1127,28 @@
         if (lastRealTime) {
           const gap = cur.datetime - lastRealTime;
           
-          // TCO para evaluar el gap
+          // TCO para evaluar el gap — usa el último punto real (no lento)
           const gapTCO = isSimpleMode
             ? getSimpleTCOAt(lastRealTime.getTime())
             : getTCOForTimestamp(lastRealTime.getTime(), eq);
           const gapAvgInt = gapTCO * 1000;
           
+          // Si el punto anterior era lento, el gap "real" disponible para amarillos
+          // es el gap total menos el tiempo que ya ocupó el punto lento
+          const lastWasOverLimit = lastRealValue > gapTCO * 4;
+          const effectiveGap = lastWasOverLimit
+            ? Math.max(0, gap - (lastRealValue * 1000))
+            : gap;
+          
           if (gap > gapMaximo) {
-            // Gap largo: marcar líneas de período y pushear el punto en su posición real
             verticalLines.push({ x: lastRealTime.getTime(), label: 'Fin período' });
             verticalLines.push({ x: cur.datetime.getTime(), label: 'Inicio período' });
-            
             if (isOverLimit) {
               complete.push({ x: cur.datetime.getTime(), y: currentTCO, isProjected: false, isHollow: true, realValue: cur.value });
             } else {
               complete.push({ x: cur.datetime.getTime(), y: cur.value, isProjected: false, isHollow: false });
             }
-          } else if (gap > gapAvgInt * gapMinMult) {
+          } else if (effectiveGap > gapAvgInt * gapMinMult) {
             // Gap normal (>3×TCO pero <gapMaximo)
             let pt = new Date(lastRealTime.getTime() + gapAvgInt);
             const targetTime = cur.datetime;
@@ -1159,45 +1181,11 @@
             }
             
             if (isOverLimit) {
-              const tolerance = (currentTCO / 2) * 1000;
-              const coincidentIndices = [];
-              
-              for (let idx = complete.length - 1; idx >= 0; idx--) {
-                const p = complete[idx];
-                if (p.isProjected && !p.isHollow && 
-                    p.x < cur.datetime.getTime() && 
-                    Math.abs(p.x - cur.datetime.getTime()) <= tolerance) {
-                  coincidentIndices.push(idx);
-                }
-              }
-              
-              for (const idx of coincidentIndices) {
-                complete.splice(idx, 1);
-              }
-              
               complete.push({ x: cur.datetime.getTime(), y: currentTCO, isProjected: false, isHollow: true, realValue: cur.value });
             } else {
-              const adjustedTime = new Date(pt.getTime() - gapAvgInt + gapAvgInt);
-              complete.push({ x: adjustedTime.getTime(), y: cur.value, isProjected: false, isHollow: false });
+              complete.push({ x: cur.datetime.getTime(), y: cur.value, isProjected: false, isHollow: false });
             }
           } else if (isOverLimit) {
-            // Punto sobre límite sin gap previo
-            const tolerance = (currentTCO / 2) * 1000;
-            const coincidentIndices = [];
-            
-            for (let idx = complete.length - 1; idx >= 0; idx--) {
-              const p = complete[idx];
-              if (p.isProjected && !p.isHollow && 
-                  p.x < cur.datetime.getTime() && 
-                  Math.abs(p.x - cur.datetime.getTime()) <= tolerance) {
-                coincidentIndices.push(idx);
-              }
-            }
-            
-            for (const idx of coincidentIndices) {
-              complete.splice(idx, 1);
-            }
-            
             complete.push({ x: cur.datetime.getTime(), y: currentTCO, isProjected: false, isHollow: true, realValue: cur.value });
           } else {
             // Sin gap ni sobre límite
@@ -1212,8 +1200,9 @@
           }
         }
         
-        // Actualizar lastRealTime - SIEMPRE, incluyendo puntos lentos
+        // Actualizar lastRealTime y lastRealValue
         lastRealTime = cur.datetime;
+        lastRealValue = cur.value;
       }
       
       // Propagar códigos (TOK/TNG) desde data a complete
@@ -1247,7 +1236,7 @@
         
         while (pt <= now && safetyCounter < MAX_PROJECTIONS) {
           const projTCO = isSimpleMode
-            ? simpleTCO
+            ? getSimpleTCOAt(pt.getTime())
             : getTCOForTimestamp(pt.getTime(), eq);
           const stopType = getStopType(pt.getTime());
           complete.push({ 
