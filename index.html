@@ -801,6 +801,10 @@
               <div class="stat-value" id="stat-avg-${eq}">0</div>
               <div class="stat-label">${label2}</div>
             </div>
+            <div class="stat-item" id="stat-eff-${eq}" style="display:none;">
+              <div class="stat-value" id="stat-eff-val-${eq}" style="color:#f59e0b;">-</div>
+              <div class="stat-label">Ef. promedio</div>
+            </div>
             <div class="stat-item" id="stat-opttco-${eq}" style="display:none; color:#34d399; font-size:0.8em; align-self:center;"></div>
           </div>
         </div>
@@ -1106,6 +1110,7 @@
           const optTCO = Math.max(1, Math.round(vals.slice(0, n).reduce((s,v)=>s+v,0) / n));
           return { start, end, optTCO: optTCO > 0 ? optTCO : simpleTCO };
         });
+        equipmentSettings[eq].simplePeriods = simplePeriods;
       }
       
       // Helper: TCO activo en un timestamp para modo simple (por período)
@@ -1548,6 +1553,7 @@
           const velocidad = realPoints.length > 0 ? velSum / realPoints.length : 0;
 
           const efficiency = Math.round(ocupacion * velocidad * 100);
+          sp.efficiency = efficiency; // guardar para el promedio del card
 
           const color = efficiency >= 85 ? '#16a34a'
                       : efficiency >= 65 ? '#f59e0b'
@@ -2020,6 +2026,41 @@
             optTCOEl.style.display = '';
           } else {
             optTCOEl.style.display = 'none';
+          }
+        }
+        
+        // Eficiencia promedio: calcular sobre períodos visibles en modo simple
+        const effEl    = document.getElementById(`stat-eff-${eq}`);
+        const effValEl = document.getElementById(`stat-eff-val-${eq}`);
+        if (effEl && effValEl) {
+          const periods = equipmentSettings[eq]?.simplePeriods;
+          if (isSimpleMode && periods && periods.length > 0) {
+            const xMin = xScale.min;
+            const xMax = xScale.max;
+            
+            // Solo períodos visibles que ya tienen eficiencia calculada
+            const visiblePeriods = periods.filter(p =>
+              p.start <= xMax && p.end >= xMin && p.efficiency != null
+            );
+            
+            if (visiblePeriods.length > 0) {
+              // Usar directamente la eficiencia del tooltip — mismo cálculo, mismos números
+              const effs = visiblePeriods.map(sp => sp.efficiency);
+              
+              if (effs.length > 0) {
+                const avgEff = Math.round(effs.reduce((a,b) => a+b, 0) / effs.length);
+                const color  = avgEff >= 85 ? '#16a34a' : avgEff >= 65 ? '#f59e0b' : '#dc2626';
+                effValEl.textContent    = `${avgEff}%`;
+                effValEl.style.color    = color;
+                effEl.style.display     = '';
+              } else {
+                effEl.style.display = 'none';
+              }
+            } else {
+              effEl.style.display = 'none';
+            }
+          } else {
+            effEl.style.display = 'none';
           }
         }
       }
